@@ -42,7 +42,12 @@ def check(secret: str | None) -> None:
 
 
 def _has_cuda() -> bool:
+    # avoid importing torch on every health check if possible
     try:
+        import importlib.util
+
+        if importlib.util.find_spec("torch") is None:
+            return False
         import torch
 
         return bool(torch.cuda.is_available())
@@ -50,14 +55,24 @@ def _has_cuda() -> bool:
         return False
 
 
+def _pkg_installed(name: str) -> bool:
+    """Fast check — do NOT import heavy packages (easyocr/whisper hang first load)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
 @app.get("/health")
 def health(x_vc_secret: str | None = Header(default=None)) -> dict[str, Any]:
     check(x_vc_secret)
+    # Keep health *fast* — no torch/easyocr import here (prevents tunnel timeouts)
     return {
         "ok": True,
         "worker": "colab",
         "port": WORKER_PORT,
-        "cuda": _has_cuda(),
         "features": ["asr", "ocr", "tts", "translate"],
     }
 
@@ -65,32 +80,16 @@ def health(x_vc_secret: str | None = Header(default=None)) -> dict[str, Any]:
 @app.get("/capabilities")
 def capabilities(x_vc_secret: str | None = Header(default=None)) -> dict[str, Any]:
     check(x_vc_secret)
-    whisper = False
-    easy = False
-    edge = False
-    try:
-        import faster_whisper  # noqa: F401
-
-        whisper = True
-    except Exception:
-        pass
-    try:
-        import easyocr  # noqa: F401
-
-        easy = True
-    except Exception:
-        pass
-    try:
-        import edge_tts  # noqa: F401
-
-        edge = True
-    except Exception:
-        pass
+    # find_spec only — importing easyocr/faster_whisper on first request can block minutes
+    whisper = _pkg_installed("faster_whisper")
+    easy = _pkg_installed("easyocr")
+    edge = _pkg_installed("edge_tts")
+    deep = _pkg_installed("deep_translator")
     return {
         "asr": whisper,
         "ocr": easy,
         "tts": edge,
-        "translate": True,
+        "translate": deep or True,
         "cuda": _has_cuda(),
         "worker": "colab",
         "parity": {
