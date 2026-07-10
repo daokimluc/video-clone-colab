@@ -296,7 +296,6 @@ async def infer_tts(
     """JSON body (no Pydantic model — works when loaded via importlib on Colab)."""
     check(x_vc_secret)
     try:
-        import asyncio
         import edge_tts
     except ImportError as exc:
         raise HTTPException(500, "edge-tts not installed") from exc
@@ -334,7 +333,8 @@ async def infer_tts(
                 )
             else:
                 communicate = edge_tts.Communicate(text, voice)
-                asyncio.run(communicate.save(str(mp3)))
+                # endpoint is already async — never asyncio.run() inside FastAPI
+                await communicate.save(str(mp3))
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", str(mp3), str(wav)],
                     capture_output=True,
