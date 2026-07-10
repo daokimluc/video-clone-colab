@@ -23,9 +23,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 SHARED_SECRET = os.environ.get("VC_COLAB_SECRET") or os.environ.get("SHARED_SECRET") or ""
 WORKER_PORT = int(os.environ.get("VC_WORKER_PORT", "8765"))
@@ -289,26 +288,12 @@ async def infer_ocr(
     return {"status": "ok", "engine": "easyocr", "segment_count": len(segments), "segments": segments}
 
 
-class TtsSeg(BaseModel):
-    idx: int | None = None
-    start: float = 0
-    end: float = 1
-    source: str = ""
-    translation: str = ""
-    voice: str | None = None
-
-
-class TtsReq(BaseModel):
-    default_voice: str = "vi-VN-HoaiMyNeural"
-    time_fit: str = "absolute"
-    segments: list[TtsSeg] = Field(default_factory=list)
-
-
 @app.post("/infer/tts")
 async def infer_tts(
-    body: TtsReq,
+    request: Request,
     x_vc_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    """JSON body (no Pydantic model — works when loaded via importlib on Colab)."""
     check(x_vc_secret)
     try:
         import asyncio
@@ -316,17 +301,22 @@ async def infer_tts(
     except ImportError as exc:
         raise HTTPException(500, "edge-tts not installed") from exc
 
+    body = await request.json()
+    default_voice = body.get("default_voice") or "vi-VN-HoaiMyNeural"
+    segments = body.get("segments") or []
+
     items = []
     with tempfile.TemporaryDirectory(prefix="vc-tts-") as td:
         tdir = Path(td)
-        for i, seg in enumerate(body.segments):
-            text = (seg.translation or seg.source or "").strip()
-            voice = seg.voice or body.default_voice
-            idx = seg.idx if seg.idx is not None else i + 1
+        for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
+            text = (seg.get("translation") or seg.get("source") or "").strip()
+            voice = seg.get("voice") or default_voice
+            idx = seg.get("idx") if seg.get("idx") is not None else i + 1
             mp3 = tdir / f"{idx}.mp3"
             wav = tdir / f"{idx}.wav"
             if not text:
-                # tiny silence
                 subprocess.run(
                     [
                         "ffmpeg",
@@ -350,10 +340,8 @@ async def infer_tts(
                     capture_output=True,
                     check=False,
                 )
-            # optional time-fit to segment duration
-            target = max(0.2, float(seg.end) - float(seg.start))
+            target = max(0.2, float(seg.get("end") or 1) - float(seg.get("start") or 0))
             fitted = tdir / f"{idx}_fit.wav"
-            # simple atempo if duration known via ffprobe
             dur = target
             try:
                 pr = subprocess.run(
@@ -371,12 +359,10 @@ async def infer_tts(
                     text=True,
                     check=False,
                 )
-                import json as _json
-
-                dur = float(_json.loads(pr.stdout or "{}").get("format", {}).get("duration") or target)
+                dur = float(json.loads(pr.stdout or "{}").get("format", {}).get("duration") or target)
             except Exception:
                 pass
-            if dur > 0.05 and abs(dur - target) / target > 0.08:
+            if dur > 0.05 and abs(dur - target) / max(target, 0.01) > 0.08:
                 speed = max(0.5, min(2.0, dur / target))
                 subprocess.run(
                     [
@@ -394,6 +380,8 @@ async def infer_tts(
                 use = fitted if fitted.is_file() else wav
             else:
                 use = wav
+            if not use.is_file():
+                raise HTTPException(500, f"TTS failed for idx={idx}")
             b64 = base64.b64encode(use.read_bytes()).decode("ascii")
             items.append(
                 {
@@ -407,21 +395,9 @@ async def infer_tts(
     return {"status": "ok", "engine": "edge-tts", "items": items}
 
 
-class TrSeg(BaseModel):
-    idx: int | None = None
-    source: str = ""
-    translation: str = ""
-
-
-class TrReq(BaseModel):
-    target_lang: str = "vi"
-    source_lang: str = "auto"
-    segments: list[TrSeg] = Field(default_factory=list)
-
-
 @app.post("/infer/translate")
 async def infer_translate(
-    body: TrReq,
+    request: Request,
     x_vc_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     check(x_vc_secret)
@@ -430,14 +406,19 @@ async def infer_translate(
     except ImportError as exc:
         raise HTTPException(500, "deep-translator not installed") from exc
 
-    src = body.source_lang if body.source_lang not in {"auto", ""} else "auto"
-    tgt = body.target_lang or "vi"
+    body = await request.json()
+    src = body.get("source_lang") or "auto"
+    if src in {"auto", ""}:
+        src = "auto"
+    tgt = body.get("target_lang") or "vi"
     translator = GoogleTranslator(source=src if src != "auto" else "auto", target=tgt)
     out = []
-    for seg in body.segments:
-        text = (seg.source or "").strip()
+    for seg in body.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        text = (seg.get("source") or "").strip()
         tr = translator.translate(text) if text else ""
-        out.append({"idx": seg.idx, "source": seg.source, "translation": tr})
+        out.append({"idx": seg.get("idx"), "source": seg.get("source"), "translation": tr})
     return {"status": "ok", "engine": "google", "segments": out}
 
 
